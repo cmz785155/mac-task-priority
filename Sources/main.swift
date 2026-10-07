@@ -1,228 +1,209 @@
 import AppKit
-import IOKit.ps
-
-
-struct Mode {
-    let name: String
-    let detail: String
-    let ac: Bool
-    let value: Int
-    var arguments: [String] { [ac ? "-c" : "-b", "powermode", String(value)] }
-}
+import Darwin
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    let modes = [
-        Mode(name: "插电 · 极致性能", detail: "高电量模式 · 大模型 / 视频剪辑", ac: true, value: 2),
-        Mode(name: "插电 · 普通均衡", detail: "自动模式 · 系统平衡性能、温度与噪音", ac: true, value: 0),
-        Mode(name: "离电 · 高性能", detail: "高电量模式 · 更耗电，保留系统保护", ac: false, value: 2),
-        Mode(name: "离电 · 轻度工作", detail: "低电量模式 · 码字 / 浏览 / 聊天 / 影音", ac: false, value: 1)
-    ]
-    let worker = DispatchQueue(label: "local.macpowermodes.operations", qos: .utility)
-    var supportsHighPower = false
-    var menuOpen = false
-    var adapterWatts: Int?
+    let worker = DispatchQueue(label: "local.macpowermodes.tasks", qos: .utility)
+    let priority = TaskPriority()
     var item: NSStatusItem!
-    var source: CFRunLoopSource?
+    var sessions: [PriorityLease] = []
+    var menuOpen = false
     var busy = false
-    var settings = PowerSettings()
-    var onAC = true
-    var batteryPercent: Int?
-    var status = "点击模式配置对应电源；插拔电源由系统自动切换。"
+    var refreshing = false
+    var status = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "bolt.circle", accessibilityDescription: "Mac 能耗模式")
+        item.button?.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Mac 任务优先级")
         item.menu = NSMenu()
         item.menu?.delegate = self
-        let callback: IOPowerSourceCallbackType = { context in
-            guard let context else { return }
-            let delegate = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
-            let previousSource = delegate.onAC
-            delegate.updatePower()
-            if previousSource != delegate.onAC { delegate.refreshSettings() }
-            if delegate.menuOpen { delegate.rebuildMenu() }
-        }
-        source = IOPSNotificationCreateRunLoopSource(callback, Unmanaged.passUnretained(self).toOpaque()).takeRetainedValue()
-        if let source { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
-        NotificationCenter.default.addObserver(self, selector: #selector(thermalChanged), name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(wokeUp), name: NSWorkspace.didWakeNotification, object: nil)
-        updatePower()
+        NotificationCenter.default.addObserver(self, selector: #selector(stateChanged), name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stateChanged), name: NSWorkspace.didWakeNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stateChanged), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         rebuildMenu()
-        refreshSettings()
     }
-    @objc func thermalChanged() { if menuOpen { rebuildMenu() } }
-    @objc func wokeUp() { updatePower(); refreshSettings() }
-    func refreshSettings() {
-        guard !busy else { return }
+    @objc func stateChanged() { if menuOpen { rebuildMenu(); refreshSessions() } }
+    func menuWillOpen(_ menu: NSMenu) { menuOpen = true; rebuildMenu(); refreshSessions() }
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
+    func refreshSessions() {
+        guard !busy && !refreshing && !sessions.isEmpty else { return }
+        refreshing = true
         worker.async { [self] in
-            let refreshed = readSettings()
-            let highPower = readHighPowerSupport()
+            priority.cleanupExpired()
+            let snapshot = priority.leases
             DispatchQueue.main.async { [self] in
-                settings = refreshed
-                supportsHighPower = highPower
-                updatePower()
-                if menuOpen { rebuildMenu() }
-            }
-        }
-    }
-    func updatePower() {
-        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return }
-        onAC = (IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?) == kIOPSACPowerValue
-        batteryPercent = nil
-        adapterWatts = nil
-        if onAC, let adapter = IOPSCopyExternalPowerAdapterDetails()?.takeRetainedValue() as? [String: Any] {
-            adapterWatts = adapter[kIOPSPowerAdapterWattsKey] as? Int
-        }
-        if let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] {
-            for power in sources {
-                if let description = IOPSGetPowerSourceDescription(info, power)?.takeUnretainedValue() as? [String: Any],
-                   let current = description[kIOPSCurrentCapacityKey] as? Int,
-                   let max = description[kIOPSMaxCapacityKey] as? Int, max > 0 {
-                    batteryPercent = current * 100 / max
+                refreshing = false
+                if sessions != snapshot {
+                    sessions = snapshot
+                    if menuOpen { rebuildMenu() }
+                    updateIcon()
                 }
             }
         }
-        let value = settings.value(forAC: onAC)
-        item.button?.title = value == 2 ? " 高" : value == 1 ? " 省" : value == 0 ? " 自动" : " 未知"
-        item.button?.toolTip = "Mac 能耗模式 · \(onAC ? "插电" : "电池供电")"
     }
-    func menuWillOpen(_ menu: NSMenu) {
-        menuOpen = true
-        updatePower()
-        rebuildMenu()
-        refreshSettings()
+    func updateIcon() {
+        item.button?.title = sessions.isEmpty ? "" : " \(sessions.count)"
+        item.button?.toolTip = sessions.isEmpty ? "Mac 任务优先级 · 无活动会话" : "Mac 任务优先级 · \(sessions.count) 个任务"
     }
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
-    func label(_ text: String, menu: NSMenu) {
-        let row = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+    func compact(_ text: String, limit: Int = 32) -> String {
+        text.count > limit ? String(text.prefix(limit - 1)) + "…" : text
+    }
+    func label(_ title: String, menu: NSMenu, heading: Bool = false, tooltip: String? = nil) {
+        let row = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         row.isEnabled = false
+        row.toolTip = tooltip
+        if heading { row.attributedTitle = NSAttributedString(string: title, attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.secondaryLabelColor]) }
         menu.addItem(row)
+    }
+    @discardableResult
+    func action(_ title: String, selector: Selector, symbol: String? = nil, enabled: Bool = true, menu: NSMenu) -> NSMenuItem {
+        let row = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+        row.target = self
+        row.isEnabled = enabled
+        if let symbol { row.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) }
+        menu.addItem(row)
+        return row
     }
     func rebuildMenu() {
         guard let menu = item.menu else { return }
         menu.removeAllItems()
-        label("Mac 能耗模式", menu: menu)
-        label("\(onAC ? "⚡ 插电" : "🔋 电池供电") · 电量 \(batteryPercent.map { "\($0)%" } ?? "未知")", menu: menu)
-        if onAC { label("适配器供电能力：\(adapterWatts.map { "\($0) W" } ?? "未知") · 非实时耗电", menu: menu) }
-        label("当前生效：\(onAC ? "插电" : "离电")策略", menu: menu)
+        label("Mac 任务优先级", menu: menu, heading: true)
+        label(sessions.isEmpty ? "选择任务，提高 CPU 调度优先级" : "正在调节 \(sessions.count) 个任务", menu: menu)
+        menu.addItem(.separator())
+        action("选择应用或任务…", selector: #selector(selectTask), symbol: "plus.circle", enabled: !busy, menu: menu)
+        if !sessions.isEmpty {
+            menu.addItem(.separator())
+            label("活动任务", menu: menu, heading: true)
+            for lease in sessions {
+                let remaining = max(0, Int(ceil(lease.expires.timeIntervalSinceNow / 60)))
+                let row = NSMenuItem(title: "\(compact(lease.name, limit: 20)) · \(remaining) 分钟", action: nil, keyEquivalent: "")
+                row.image = NSImage(systemSymbolName: "speedometer", accessibilityDescription: nil)
+                row.toolTip = lease.name
+                let details = NSMenu()
+                label(lease.name, menu: details, heading: true)
+                label("PID \(lease.identity.pid) · nice \(lease.identity.nice) → \(lease.desired)", menu: details)
+                label("仅此进程 · 不包含子进程", menu: details)
+                details.addItem(.separator())
+                let restore = action("结束并恢复原优先级", selector: #selector(restoreTask(_:)), symbol: "arrow.uturn.backward", enabled: !busy, menu: details)
+                restore.tag = Int(lease.identity.pid)
+                row.submenu = details
+                menu.addItem(row)
+            }
+            action("结束全部并恢复", selector: #selector(restoreAll), symbol: "arrow.counterclockwise", enabled: !busy, menu: menu)
+        }
+        menu.addItem(.separator())
         let thermal: String
         switch ProcessInfo.processInfo.thermalState {
-        case .nominal: thermal = "正常"
-        case .fair: thermal = "温热"
-        case .serious: thermal = "较高 · 系统保护中"
-        case .critical: thermal = "很高 · 系统保护中"
-        @unknown default: thermal = "未知"
+        case .nominal: thermal = "系统热状态正常"
+        case .fair: thermal = "系统热状态：温热"
+        case .serious: thermal = "系统热状态：较高 · 保护中"
+        case .critical: thermal = "系统热状态：很高 · 保护中"
+        @unknown default: thermal = "系统热状态未知"
         }
-        label("系统热状态：\(thermal)", menu: menu)
-        menu.addItem(.separator())
-        for (index, mode) in modes.enumerated() {
-            let row = NSMenuItem(title: mode.name, action: #selector(selectMode(_:)), keyEquivalent: "")
-            row.target = self
-            row.tag = index
-            row.state = settings.value(forAC: mode.ac) == mode.value ? .on : .off
-            row.isEnabled = !busy && settings.value(forAC: mode.ac) != nil && (mode.value != 2 || supportsHighPower)
-            menu.addItem(row)
-            label("    \(mode.detail)", menu: menu)
+        label(thermal, menu: menu, tooltip: "系统热压力状态，不是温度测量；本软件不修改温控。")
+        if busy || !status.isEmpty { label(busy ? "正在处理…" : compact(status), menu: menu, tooltip: status) }
+        let preferences = NSMenuItem(title: "设置与说明", action: nil, keyEquivalent: "")
+        preferences.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        let settingsMenu = NSMenu()
+        if TaskAuthorization.legacyPermissionExists {
+            action("移除旧版电源免密权限…", selector: #selector(removeLegacy), symbol: "lock", enabled: !busy, menu: settingsMenu)
+            settingsMenu.addItem(.separator())
         }
-        if !supportsHighPower { label("本机未报告高电量模式支持；性能选项暂不可用。", menu: menu) }
+        label("30 分钟到期或退出软件后恢复", menu: settingsMenu)
+        action("使用说明", selector: #selector(showAbout), symbol: "info.circle", menu: settingsMenu)
+        preferences.submenu = settingsMenu
+        menu.addItem(preferences)
         menu.addItem(.separator())
-        label(busy ? "正在处理电源设置…" : status, menu: menu)
-        label("仅配置电源策略；不会退出、暂停或关闭应用和项目。", menu: menu)
-        label("两种电源分别记忆设置；退出本软件后仍生效。", menu: menu)
-        let reset = NSMenuItem(title: "两种电源均恢复自动模式…", action: #selector(resetSettings), keyEquivalent: "")
-        reset.target = self
-        reset.isEnabled = !busy
-        menu.addItem(reset)
-        let access = NSMenuItem(title: PowerAuthorization.installed ? "撤销免密切换…" : "启用首次授权免密切换…", action: #selector(toggleAuthorization), keyEquivalent: "")
-        access.target = self
-        access.isEnabled = !busy
-        menu.addItem(access)
-        let battery = NSMenuItem(title: "打开系统电池设置", action: #selector(openBattery), keyEquivalent: "")
-        battery.target = self
-        menu.addItem(battery)
-        let about = NSMenuItem(title: "使用说明", action: #selector(showAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 Mac 能耗模式", action: #selector(quitApp), keyEquivalent: "q")
-        quit.target = self
-        quit.isEnabled = !busy
-        menu.addItem(quit)
+        let quit = action("退出", selector: #selector(quitApp), enabled: !busy, menu: menu)
+        quit.keyEquivalent = "q"
+        updateIcon()
     }
-    @objc func selectMode(_ sender: NSMenuItem) {
-        let mode = modes[sender.tag]
-        apply(arguments: mode.arguments, expectedAC: mode.ac ? mode.value : nil, expectedBattery: mode.ac ? nil : mode.value, message: "已配置：\(mode.name)\(mode.ac == onAC ? "" : "（切换至该电源时生效）")")
-    }
-    @objc func resetSettings() {
-        apply(arguments: ["-a", "powermode", "0"], expectedAC: 0, expectedBattery: 0, message: "插电与离电均已恢复自动模式。")
-    }
-    func apply(arguments: [String], expectedAC: Int?, expectedBattery: Int?, message: String) {
+    func perform(_ operation: @escaping () -> CommandResult) {
         guard !busy else { return }
-        busy = true
-        rebuildMenu()
+        busy = true; rebuildMenu()
         worker.async { [self] in
-            let before = readSettings()
-            let alreadyApplied = before.matches(ac: expectedAC, battery: expectedBattery)
-            let result = alreadyApplied ? CommandResult(code: 0, output: "") : PowerAuthorization.apply(arguments)
-            let newSettings = alreadyApplied ? before : readSettings()
-            let verified = newSettings.matches(ac: expectedAC, battery: expectedBattery)
+            let result = operation()
+            let snapshot = priority.leases
             DispatchQueue.main.async { [self] in
-                settings = newSettings
-                busy = false
-                if result.code == -128 { status = "已取消授权，未由本软件应用设置。" }
-                else if result.code != 0 { status = "应用失败；请查看错误详情。"; showError(result.output) }
-                else if !verified { status = "设置未通过回读验证。"; showError("macOS 未返回预期模式，请在系统电池设置中核对。") }
-                else { status = alreadyApplied ? "该策略已生效，无需重复应用。" : message }
-                updatePower()
+                busy = false; sessions = snapshot
+                status = result.code == -128 ? "已取消授权。" : result.output
+                if result.code != 0 && result.code != -128 { showError(result.output) }
                 rebuildMenu()
             }
         }
     }
-    @objc func toggleAuthorization() {
+    @objc func selectTask() {
         guard !busy else { return }
-        let remove = PowerAuthorization.installed
-        busy = true
-        rebuildMenu()
-        worker.async { [self] in
-            let result = remove ? PowerAuthorization.uninstall() : PowerAuthorization.install()
-            DispatchQueue.main.async { [self] in
-                busy = false
-                if result.code == -128 { status = "已取消系统授权。" }
-                else if result.code != 0 { status = "权限设置失败。"; showError(result.output) }
-                else { status = remove ? "已撤销；下次切换需要重新授权。" : "首次授权完成，之后切换无需输入密码。" }
-                rebuildMenu()
-            }
+        NSApp.activate(ignoringOtherApps: true)
+        let apps = NSWorkspace.shared.runningApplications.filter { $0.processIdentifier != getpid() && $0.activationPolicy == .regular }
+            .sorted { ($0.localizedName ?? "").localizedStandardCompare($1.localizedName ?? "") == .orderedAscending }
+        let panel = NSAlert()
+        panel.messageText = "选择要调节的任务"
+        panel.informativeText = "提高所选进程的 CPU 调度优先级，持续 30 分钟。收益取决于 CPU 争抢与应用自身调度；不会锁定频率或改变 GPU 调度。开始需管理员授权，可随时结束并恢复。"
+        panel.addButton(withTitle: "开始")
+        panel.addButton(withTitle: "取消")
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 390, height: 144))
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 390, height: 28))
+        picker.addItems(withTitles: apps.map { "\($0.localizedName ?? "应用")（PID \($0.processIdentifier)）" })
+        let custom = NSTextField(frame: NSRect(x: 0, y: 0, width: 390, height: 26))
+        custom.placeholderString = "可选：工作进程 PID，覆盖上方应用选择"
+        custom.toolTip = "大模型和剪辑应用可能由后台进程计算；可从活动监视器查找该进程 PID。"
+        let level = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 390, height: 28))
+        level.addItems(withTitles: ["提高调度优先级（nice -5）", "更高调度优先级（nice -10）"])
+        let controls = [("应用", picker as NSView), ("后台任务（可选）", custom as NSView), ("CPU 调度", level as NSView)]
+        for (index, control) in controls.enumerated() {
+            let y = CGFloat(2 - index) * 48
+            let caption = NSTextField(labelWithString: control.0)
+            caption.frame = NSRect(x: 0, y: y + 28, width: 390, height: 16)
+            caption.font = NSFont.systemFont(ofSize: 11)
+            caption.textColor = .secondaryLabelColor
+            control.1.setFrameOrigin(NSPoint(x: 0, y: y))
+            view.addSubview(caption); view.addSubview(control.1)
+        }
+        panel.accessoryView = view
+        guard panel.runModal() == .alertFirstButtonReturn else { return }
+        let typed = custom.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected = picker.indexOfSelectedItem
+        let pid: Int32?
+        let name: String
+        if !typed.isEmpty { pid = Int32(typed); name = "进程 \(typed)" }
+        else if apps.indices.contains(selected) { pid = apps[selected].processIdentifier; name = apps[selected].localizedName ?? "应用" }
+        else { pid = nil; name = "" }
+        guard let pid, pid > 1 else { showError("请选择应用或输入有效的工作进程 PID。"); return }
+        let desired = level.indexOfSelectedItem == 0 ? -5 : -10
+        perform { [self] in
+            let result = priority.start(pid: pid, name: name, desired: desired)
+            return result.code == 0 ? CommandResult(code: 0, output: "已调节 \(name)，设置已回读确认。") : result
         }
     }
+    @objc func restoreTask(_ sender: NSMenuItem) { perform { [self] in priority.end(pid: Int32(sender.tag)) } }
+    @objc func restoreAll() { perform { [self] in priority.end() } }
+    @objc func removeLegacy() { perform { TaskAuthorization.removeLegacyPermission() } }
     func showError(_ text: String) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "无法确认电源模式"
+        alert.messageText = "操作未通过验证"
         alert.informativeText = text
         alert.runModal()
     }
-    @objc func openBattery() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Battery-Settings.extension")!) }
     @objc func showAbout() {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "四种场景，系统原生电源策略"
-        alert.informativeText = "插电性能与离电性能使用系统高电量模式；普通模式使用自动；轻度工作使用低电量。\n\n高电量模式提供更积极的散热，实际提升取决于负载，不能保证始终满功耗。离电高性能更耗电，无法承诺电池零损耗。系统温控、充电和电池保护保持生效。\n\n切换需要系统授权；启用菜单中的免密切换后无需重复输入。软件不保存密码；当前账户获得五个固定电源命令的权限，也适用于该账户的其他程序。可在菜单中撤销。插电与离电独立保存，系统自动切换。本软件没有持续性能采样、网络连接或后台提权服务。\n\n建议在系统设置中开启优化电池充电。14 英寸 M4 Pro 使用高电量模式充电时，Apple 建议 96W 电源适配器。"
+        alert.messageText = "Mac 任务优先级 · 2.0.1 测试版"
+        alert.informativeText = "手动提高指定进程的 CPU 调度优先级：提高为 nice -5，更高为 -10。只作用于所选进程，不覆盖子进程或 GPU 调度。没有 CPU 争抢时可能没有速度收益，不能保证更高频率或功耗。\n\n每次会话最长 30 分钟，可从活动任务中单独恢复或结束全部；退出本软件后由临时监督进程恢复原值。外部工具改变优先级时保留其修改。\n\n每次开始需系统管理员授权，不保存密码、不新增免密权限、不安装永久提权服务。只可选择当前账户的进程，不关闭、暂停或重启你的应用和项目。\n\n菜单关闭时不采样性能；会话监督等待系统事件，不做定时性能采样，不使用 GPU。系统电源模式、风扇及温控不由本软件修改。"
         alert.runModal()
     }
+    func applicationWillTerminate(_ notification: Notification) { worker.async { [self] in priority.releaseOnQuit() } }
     @objc func quitApp() { NSApp.terminate(nil) }
 }
 
-if CommandLine.arguments.contains("--install-one-time") {
-    let result = PowerAuthorization.install()
+if CommandLine.arguments.contains("--remove-legacy-permission") {
+    let result = TaskAuthorization.removeLegacyPermission()
     print(result.output)
     exit(result.code == 0 ? 0 : 1)
 } else if CommandLine.arguments.contains("--self-test") {
-    let parsed = PowerSettings.parse("Battery Power:\n powermode 1\nAC Power:\n powermode 2\n")
-    precondition(parsed.ac == 2 && parsed.battery == 1)
-    precondition(PowerSettings.parse("unknown").ac == nil)
-    let live = readSettings()
-    precondition(live.ac != nil && live.battery != nil, "Unable to read system modes")
-    print("PASS: source parsing, missing settings, live system read; AC=\(live.ac!), battery=\(live.battery!)")
+    let priority = TaskPriority()
+    guard let own = priority.inspect(getpid()), own.uid == getuid() else { fatalError("Unable to read process identity") }
+    print("PASS: live process identity and CPU nice read; UID=\(own.uid), nice=\(own.nice)")
 } else {
     if let identifier = Bundle.main.bundleIdentifier,
        NSRunningApplication.runningApplications(withBundleIdentifier: identifier).contains(where: { $0.processIdentifier != getpid() }) { exit(0) }

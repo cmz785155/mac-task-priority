@@ -1,24 +1,20 @@
 import Foundation
+import Darwin
 
-let fixture = """
- Battery Power:
- lowpowermode 0
- powermode 1
-AC Power:
- powermode 2
-"""
-let parsed = PowerSettings.parse(fixture)
-precondition(parsed == PowerSettings(ac: 2, battery: 1))
-precondition(parsed.matches(ac: 2, battery: nil))
-precondition(!parsed.matches(ac: 0, battery: nil))
-precondition(parsed.matches(ac: nil, battery: 1))
-precondition(!PowerSettings().matches(ac: 0, battery: 0))
-precondition(PowerSettings.parse("AC Power:\n powermode invalid").ac == nil)
-precondition(PowerSettings.parse("AC Power:\n powermode 3").ac == nil)
-precondition(PowerSettings.parse("powermode 2").ac == nil)
-precondition(PowerAuthorization.allowed.count == 5)
-for command in [["-a", "sleep", "0"], ["-c", "powermode", "2", "sleep", "0"], ["/bin/sh"], ["-b", "powermode", "99"]] {
-    precondition(PowerAuthorization.apply(command).code != 0)
+precondition(TaskAuthorization.quote("a'b") == "'a'\\''b'")
+let priority = TaskPriority()
+precondition(priority.start(pid: getpid(), name: "self", desired: -5).code != 0)
+precondition(priority.start(pid: 0, name: "invalid", desired: -20).code != 0)
+let helper = CommandLine.arguments[1]
+let live = TaskAuthorization.run(helper, ["--inspect", String(getpid())])
+precondition(live.code == 0)
+let values = live.output.split(whereSeparator: { $0.isWhitespace })
+precondition(values.count == 4 && UInt32(values[0]) == getuid())
+let native = priority.inspect(getpid())!
+precondition(native.uid == UInt32(values[0]) && native.seconds == UInt64(values[1]) && native.microseconds == UInt64(values[2]) && native.nice == Int(values[3]))
+precondition(priority.inspect(0) == nil && priority.inspect(1) == nil && priority.inspect(-1) == nil)
+for args in [["--inspect", "0"], ["--inspect", "-1"], ["--inspect", "2147483648"], ["--inspect", "1;echo unsafe"], ["--session"], ["--unknown"]] {
+    precondition(TaskAuthorization.run(helper, args).code != 0)
 }
-precondition(PowerAuthorization.quote("a'b") == "'a'\\''b'")
-print("PASS: power-source isolation, malformed/missing settings, no-op matching, unauthorized commands rejected")
+precondition(priority.leases.isEmpty)
+print("PASS: live identity, invalid arguments, self-target and unsupported priority rejected")

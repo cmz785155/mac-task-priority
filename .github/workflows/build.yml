@@ -11,9 +11,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: ./scripts/test.sh
       - run: ./scripts/build.sh
-      - run: codesign --verify --deep --strict dist/release/Mac能耗模式.app
-      - run: ditto -c -k --sequesterRsrc --keepParent dist/release/Mac能耗模式.app dist/MacPowerModes-arm64.zip
+      - run: codesign --verify --deep --strict dist/release/Mac任务优先级.app
+      - run: ditto -c -k --sequesterRsrc --keepParent dist/release/Mac任务优先级.app dist/MacTaskPriority-arm64.zip
       - uses: actions/upload-artifact@v4
         with:
-          name: MacPowerModes-arm64
-          path: dist/MacPowerModes-arm64.zip
+          name: MacTaskPriority-arm64
+          path: dist/MacTaskPriority-arm64.zip
