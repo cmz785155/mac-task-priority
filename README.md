@@ -2,7 +2,7 @@
 
 轻量的 Apple Silicon Mac 菜单栏工具，手动提高指定进程的 CPU 调度优先级。原生 Swift / AppKit，无第三方运行时、网络请求或持续 CPU/GPU 性能采样。
 
-**2.0.1 为公开测试版。** 已移除全部五种电源档位及 pmset 切换。请下载 [2.0.1 安装包](https://github.com/cmz785155/mac-power-modes/releases/tag/v2.0.1)；1.x 旧包仍是电源模式工具。
+**2.0.1 为公开测试版。** 已移除全部五种电源档位及 pmset 切换。请下载 [2.0.1 安装包](https://github.com/cmz785155/mac-task-priority/releases/tag/v2.0.1)；1.x 旧包仍是电源模式工具。
 
 ## 使用
 
