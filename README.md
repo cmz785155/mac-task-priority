@@ -53,3 +53,7 @@ sudo /usr/bin/python3 Tests/priority-session.py dist/release/Mac任务优先级.
 无遥测、广告、云服务或密码存储。MIT，见 LICENSE。权限设计及恢复边界见 [SECURITY.md](SECURITY.md)。
 
 2.0.1 的直接读取、事件等待及本机开销测量见 [performance.md](docs/performance.md)。
+
+## 制作人
+
+GPT
